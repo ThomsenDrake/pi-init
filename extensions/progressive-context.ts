@@ -114,7 +114,7 @@ export default function progressiveContextExtension(pi: ExtensionAPI) {
     maxContextSize: MAX_CONTEXT_SIZE,
     filenames: [...AGENTS_FILENAMES], // Clone to avoid mutation
     excludeRoot: true,
-    ...(pi.config.progressiveContext || {}),
+    ...(pi.config?.progressiveContext || {}),
   };
   
   // Merge filenames array properly instead of replacing
