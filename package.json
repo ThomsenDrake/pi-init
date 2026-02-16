@@ -7,7 +7,7 @@
   "author": "Community",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yourusername/pi-init"
+    "url": "https://github.com/ThomsenDrake/pi-init"
   },
   "pi": {
     "prompts": ["./prompts"],

@@ -19,7 +19,7 @@ Hierarchical context initialization for [Pi Coding Agent](https://github.com/bad
 ### Via Git (Recommended)
 
 ```bash
-pi install git:github.com/yourusername/pi-init
+pi install git:github.com/ThomsenDrake/pi-init
 ```
 
 ### Via Local Path
@@ -33,7 +33,7 @@ pi install /path/to/pi-init
 
 ```bash
 # Install only for current project
-pi install git:github.com/yourusername/pi-init -l
+pi install git:github.com/ThomsenDrake/pi-init -l
 ```
 
 ## Usage
