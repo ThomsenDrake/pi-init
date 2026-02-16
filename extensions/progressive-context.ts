@@ -13,6 +13,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 const AGENTS_FILENAMES = ["AGENTS.md", "CLAUDE.md", "CLA.md"];
 const CONTEXT_SEPARATOR = "\n\n---\n\n";
 const MAX_CONTEXT_SIZE = 2000; // Characters to inject
+const MAX_CACHED_SESSIONS = 100; // Prevent unbounded memory growth
 
 interface ProgressiveContextConfig {
   enabled: boolean;
@@ -28,6 +29,12 @@ interface SessionCache {
 const sessionCaches = new Map<string, SessionCache>();
 
 function getSessionCache(sessionID: string): SessionCache {
+  // Evict oldest if at capacity to prevent memory leak
+  if (sessionCaches.size >= MAX_CACHED_SESSIONS && !sessionCaches.has(sessionID)) {
+    const firstKey = sessionCaches.keys().next().value;
+    sessionCaches.delete(firstKey);
+  }
+  
   if (!sessionCaches.has(sessionID)) {
     sessionCaches.set(sessionID, {
       injectedPaths: new Set(),
@@ -45,24 +52,30 @@ function findAgentsFilesUp(
   let current = startDir;
 
   while (true) {
-    // Check if we've reached or passed root
-    const isRootOrAbove = current === rootDir || !current.startsWith(rootDir);
+    // Check if we're at root
+    const isAtRoot = current === rootDir;
+    const isAboveRoot = !current.startsWith(rootDir) && current !== rootDir;
     
-    // Skip root if configured (Pi already loads root AGENTS.md)
-    if (config.excludeRoot && isRootOrAbove) {
-      break;
-    }
-
     // Look for AGENTS.md files in current directory
-    for (const filename of config.filenames) {
-      const filePath = path.join(current, filename);
-      if (fs.existsSync(filePath)) {
-        found.push(filePath);
-        break; // Only take first match per directory
+    // Skip only if we're at root AND excludeRoot is configured
+    if (!isAtRoot || !config.excludeRoot) {
+      for (const filename of config.filenames) {
+        const filePath = path.join(current, filename);
+        try {
+          // Try to read and verify it's a file (handles race conditions)
+          const stat = fs.statSync(filePath);
+          if (stat.isFile()) {
+            found.push(filePath);
+            break; // Only take first match per directory
+          }
+        } catch {
+          // File doesn't exist or not accessible, skip
+        }
       }
     }
 
-    if (isRootOrAbove) break;
+    // Stop if we've reached or passed root
+    if (isAtRoot || isAboveRoot) break;
 
     // Move to parent
     const parent = path.dirname(current);
@@ -70,11 +83,11 @@ function findAgentsFilesUp(
     current = parent;
   }
 
-  // Return closest parent first (reverse order)
+  // Return closest parent first (reverse order - outermost first)
   return found.reverse();
 }
 
-function truncateContent(content: string, maxSize: number): string {
+function truncateContent(content: string, maxSize: number, filePath: string, rootDir: string): string {
   if (content.length <= maxSize) return content;
   
   // Try to truncate at a reasonable boundary
@@ -84,23 +97,33 @@ function truncateContent(content: string, maxSize: number): string {
     truncated.lastIndexOf("\n---\n")
   );
   
+  const relativePath = path.relative(rootDir, filePath);
+  const note = `\n\n[Note: Content truncated. Read full file: ${relativePath}]`;
+  
   if (lastBoundary > maxSize * 0.8) {
-    return truncated.slice(0, lastBoundary) + 
-           "\n\n[Note: Content truncated. Full file: read directly]";
+    return truncated.slice(0, lastBoundary) + note;
   }
   
-  return truncated + "\n\n[Note: Content truncated. Full file: read directly]";
+  return truncated + note;
 }
 
 export default function progressiveContextExtension(pi: ExtensionAPI) {
-  // Load configuration
+  // Load configuration with proper array merging
   const config: ProgressiveContextConfig = {
     enabled: true,
     maxContextSize: MAX_CONTEXT_SIZE,
-    filenames: AGENTS_FILENAMES,
+    filenames: [...AGENTS_FILENAMES], // Clone to avoid mutation
     excludeRoot: true,
     ...(pi.config.progressiveContext || {}),
   };
+  
+  // Merge filenames array properly instead of replacing
+  if (pi.config?.progressiveContext?.filenames) {
+    config.filenames = [
+      ...AGENTS_FILENAMES,
+      ...pi.config.progressiveContext.filenames,
+    ];
+  }
 
   if (!config.enabled) {
     console.log("[progressive-context] Disabled via config");
@@ -110,25 +133,34 @@ export default function progressiveContextExtension(pi: ExtensionAPI) {
   console.log("[progressive-context] Extension loaded");
 
   // Hook into tool execution
-  pi.on("tool:execute:after", async (event) => {
-    if (event.tool !== "read") return;
+  pi.on("tool_result", async (event, ctx) => {
+    if (event.toolName !== "read") return;
     
-    const sessionID = event.sessionId;
-    const filePath = event.args?.path as string;
+    const sessionID = ctx.sessionManager.getSessionId();
+    const filePath = event.input?.path;
     const rootDir = pi.workspaceRoot || process.cwd();
     
-    if (!filePath) return;
+    // Validate filePath is a string
+    if (typeof filePath !== "string" || !filePath) return;
 
     // Resolve to absolute path
     const absolutePath = path.isAbsolute(filePath) 
       ? filePath 
       : path.join(rootDir, filePath);
     
+    // Validate path stays within workspace (prevent path traversal)
+    const resolvedPath = path.resolve(absolutePath);
+    const resolvedRoot = path.resolve(rootDir);
+    if (!resolvedPath.startsWith(resolvedRoot)) {
+      console.warn(`[progressive-context] Path ${filePath} outside workspace, skipping`);
+      return;
+    }
+    
     const dir = path.dirname(absolutePath);
     const cache = getSessionCache(sessionID);
 
     // Find relevant AGENTS.md files
-    const agentsFiles = findAgentsFilesUp(dir, rootDir, config);
+    const agentsFiles = findAgentsFilesUp(dir, resolvedRoot, config);
     
     if (agentsFiles.length === 0) return;
 
@@ -141,12 +173,13 @@ export default function progressiveContextExtension(pi: ExtensionAPI) {
 
       try {
         const content = fs.readFileSync(agentsPath, "utf-8");
-        const truncated = truncateContent(content, config.maxContextSize);
+        const truncated = truncateContent(content, config.maxContextSize, agentsPath, resolvedRoot);
+        const relativePath = path.relative(resolvedRoot, agentsPath);
         
-        contexts.push(`[Directory Context: ${path.relative(rootDir, agentsPath)}]\n${truncated}`);
+        contexts.push(`[Directory Context: ${relativePath}]\n${truncated}`);
         cache.injectedPaths.add(agentsPath);
       } catch (err) {
-        // File may have been deleted between existsSync and readFileSync
+        // Log error but don't crash
         console.error(`[progressive-context] Error reading ${agentsPath}:`, err);
       }
     }
@@ -155,27 +188,32 @@ export default function progressiveContextExtension(pi: ExtensionAPI) {
       // Append context to tool result
       const contextBlock = CONTEXT_SEPARATOR + contexts.join(CONTEXT_SEPARATOR);
       
-      // Modify the output
-      event.output = event.output || {};
-      if (typeof event.output.content === "string") {
-        event.output.content += contextBlock;
-      } else {
-        event.output.context = contextBlock;
-      }
+      // Build new content array with injected context
+      const newContent = [...event.content];
+      newContent.push({ type: "text" as const, text: contextBlock });
       
       console.log(`[progressive-context] Injected ${contexts.length} context file(s) for ${filePath}`);
+      
+      // Return modified result (don't modify event directly)
+      return {
+        content: newContent,
+        details: event.details,
+        isError: event.isError,
+      };
     }
   });
 
-  // Clean up cache on session end
-  pi.on("session:end", (event) => {
-    sessionCaches.delete(event.sessionId);
-    console.log(`[progressive-context] Cleaned up session ${event.sessionId}`);
+  // Clean up cache on session shutdown
+  pi.on("session_shutdown", async (_event, ctx) => {
+    const sessionID = ctx.sessionManager.getSessionId();
+    sessionCaches.delete(sessionID);
+    console.log(`[progressive-context] Cleaned up session ${sessionID}`);
   });
 
   // Register a custom tool for manual context injection
   pi.registerTool({
     name: "inject_context",
+    label: "Inject Context",
     description: "Manually inject AGENTS.md context from a specific directory",
     parameters: {
       type: "object",
@@ -187,19 +225,28 @@ export default function progressiveContextExtension(pi: ExtensionAPI) {
       },
       required: ["directory"],
     },
-    handler: async (args, ctx) => {
-      const dir = args.directory as string;
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const dir = params.directory as string;
       const rootDir = pi.workspaceRoot || process.cwd();
-      const absoluteDir = path.isAbsolute(dir) ? dir : path.join(rootDir, dir);
+      const resolvedRoot = path.resolve(rootDir);
+      const absoluteDir = path.isAbsolute(dir) ? path.resolve(dir) : path.join(resolvedRoot, dir);
       
-      const agentsFiles = findAgentsFilesUp(absoluteDir, rootDir, {
+      // Validate path stays within workspace
+      if (!absoluteDir.startsWith(resolvedRoot)) {
+        return {
+          content: [{ type: "text" as const, text: `Error: Directory ${dir} is outside the workspace` }],
+          isError: true,
+        };
+      }
+      
+      const agentsFiles = findAgentsFilesUp(absoluteDir, resolvedRoot, {
         ...config,
         excludeRoot: false, // Allow explicit root injection
       });
       
       if (agentsFiles.length === 0) {
         return {
-          content: `No AGENTS.md files found in ${dir} or parent directories`,
+          content: [{ type: "text" as const, text: `No AGENTS.md files found in ${dir} or parent directories` }],
         };
       }
       
@@ -207,26 +254,27 @@ export default function progressiveContextExtension(pi: ExtensionAPI) {
       for (const agentsPath of agentsFiles) {
         try {
           const content = fs.readFileSync(agentsPath, "utf-8");
-          const truncated = truncateContent(content, config.maxContextSize);
-          contexts.push(`[${path.relative(rootDir, agentsPath)}]:\n${truncated}`);
+          const truncated = truncateContent(content, config.maxContextSize, agentsPath, resolvedRoot);
+          const relativePath = path.relative(resolvedRoot, agentsPath);
+          contexts.push(`[${relativePath}]:\n${truncated}`);
         } catch (err) {
           contexts.push(`[Error reading ${agentsPath}]`);
         }
       }
       
       return {
-        content: contexts.join(CONTEXT_SEPARATOR),
+        content: [{ type: "text" as const, text: contexts.join(CONTEXT_SEPARATOR) }],
       };
     },
   });
 
   // Register a command to show injected context
-  pi.registerCommand({
-    name: "context",
+  pi.registerCommand("context", {
     description: "Show currently injected progressive context for this session",
-    handler: async (ctx) => {
-      const sessionID = ctx.sessionId;
+    handler: async (_args, ctx) => {
+      const sessionID = ctx.sessionManager.getSessionId();
       const cache = getSessionCache(sessionID);
+      const rootDir = pi.workspaceRoot || process.cwd();
       
       if (cache.injectedPaths.size === 0) {
         return {
@@ -235,7 +283,7 @@ export default function progressiveContextExtension(pi: ExtensionAPI) {
       }
       
       const paths = Array.from(cache.injectedPaths).map(p => 
-        `  - ${path.relative(pi.workspaceRoot || process.cwd(), p)}`
+        `  - ${path.relative(rootDir, p)}`
       ).join("\n");
       
       return {
