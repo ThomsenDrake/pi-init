@@ -1,0 +1,16 @@
+{
+  "name": "pi-init",
+  "version": "1.0.0",
+  "description": "Hierarchical context initialization for Pi with progressive disclosure",
+  "keywords": ["pi-package", "pi", "init", "context", "agents.md"],
+  "license": "MIT",
+  "author": "Community",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/pi-init"
+  },
+  "pi": {
+    "prompts": ["./prompts"],
+    "extensions": ["./extensions"]
+  }
+}
